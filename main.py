@@ -1,4 +1,3 @@
-"""Dungeonfall, a single-file Pygame dungeon crawler."""
 from __future__ import annotations
 
 import json
@@ -176,4 +175,442 @@ class Player:
         self.focus_target = None
         self.focus_hits = 0
 
- 
+    @property
+    def clip(self):
+        return self.slots[self.active]
+
+    @property
+    def selected(self):
+        return self.clip.name
+
+    @property
+    def weapon(self):
+        return WEAPONS[self.selected]
+
+    def magazine_for(self, name):
+        return next((clip for clip in self.slots if clip and clip.name == name), None)
+
+    def steer(self, direction, dt, barriers):
+        self.moving = direction.length_squared() > 0
+        if self.moving:
+            self.pos = move(self.pos, direction.normalize() * self.speed * dt, 8, barriers)
+
+    def tick(self, dt, aim, firing=False):
+        self.aim_point = aim
+        self.aim = unit(aim - self.pos, self.aim)
+        self.left = self.aim.x < 0
+        self.cooldown = max(0.0, self.cooldown - dt)
+        self.invulnerable = max(0.0, self.invulnerable - dt)
+        self.hurt_flash = max(0.0, self.hurt_flash - dt)
+        self.flash = max(0.0, self.flash - dt)
+        self.melee_timer = max(0.0, self.melee_timer - dt)
+        self.melee_flash = max(0.0, self.melee_flash - dt)
+        if self.selected == "pulse" and firing and self.clip.rounds and not self.reload:
+            self.spin = min(1.0, self.spin + dt * 1.8)
+        else:
+            self.spin = max(0.0, self.spin - dt * 2.8)
+        if self.selected == "rapier" and firing and self.clip.rounds and not self.reload:
+            self.charge = min(RAPIER_CHARGE, self.charge + dt)
+        else:
+            self.charge = 0.0
+        if self.reload <= 0:
+            return
+        self.reload = max(0.0, self.reload - dt)
+        if self.reload == 0:
+            clip = self.clip
+            missing = self.weapon.magazine - clip.rounds
+            refill = missing if clip.reserve is None else min(missing, clip.reserve)
+            if not refill and clip.rounds == 0 and self.out_of_ammo():
+                clip.reserve = min(5, self.weapon.magazine)
+                refill = clip.reserve
+            clip.rounds += refill
+            if clip.reserve is not None:
+                clip.reserve -= refill
+
+    def select(self, slot):
+        if 0 <= slot < len(self.slots) and self.slots[slot] is not None and self.active != slot:
+            self.active = slot
+            self.reload = 0
+            self.reset_weapon_state()
+
+    def reset_weapon_state(self):
+        self.spin = self.charge = 0.0
+        self.focus_target = None
+        self.focus_hits = 0
+
+    def out_of_ammo(self):
+        return all(not clip or (clip.rounds == 0 and clip.reserve == 0) for clip in self.slots)
+
+    def start_reload(self):
+        clip = self.clip
+        if self.reload == 0 and clip.rounds < self.weapon.magazine:
+            if clip.reserve != 0:
+                self.reload = self.weapon.reload_time
+            elif self.out_of_ammo():
+                # A slow emergency refill prevents a locked arena with two dry weapons.
+                self.reload = 2.3
+
+    def shoot(self):
+        if self.cooldown > 0 or self.reload > 0:
+            return []
+        clip = self.clip
+        if clip.rounds == 0:
+            self.start_reload()
+            return []
+        key = self.selected
+        if key == "rapier" and self.charge < RAPIER_CHARGE:
+            return []
+        self.charge = 0.0
+        clip.rounds -= 1
+        self.cooldown = self.weapon.interval - (0.116 * self.spin if key == "pulse" else 0)
+        self.flash = 0.11
+        target = clip_position(self.aim_point, 10, ())[0] if key == "anvil" else None
+        return [Bullet(self.pos.copy(), self.aim.rotate(angle) * self.weapon.speed,
+                       self.weapon.damage + self.power, self.weapon.color, ttl=2.15 if key=="saw" else 1.4,
+                       piercing=self.weapon.piercing, blast=self.weapon.blast,
+                       weapon=key, destination=target)
+                for angle in self.weapon.angles]
+
+    def swing(self):
+        if self.melee_timer > 0:
+            return False
+        self.melee_timer = MELEE_INTERVAL
+        self.melee_flash = MELEE_FLASH
+        self.slash_direction = self.aim.copy()
+        return True
+
+    def hurt(self, amount):
+        if self.invulnerable or self.hp <= 0:
+            return False
+        self.hp = max(0, self.hp - amount)
+        self.invulnerable = 0.68
+        self.hurt_flash = 0.18
+        return True
+
+
+def unit(delta, default=(0, 0)):
+    return delta.normalize() if delta.length_squared() else V2(default)
+
+
+@dataclass
+class Hazard:
+    point: V2
+    wait: float
+    radius: int
+    damage: int
+    end: V2 | None = None
+
+
+class Enemy:
+    # Crawler pursues, sentry fires from range, wisp warns before each lunge.
+    SPECS = {"crawler": (37, 62, 9), "sentry": (49, 54, 10), "wisp": (34, 82, 11),
+             "shield": (69, 56, 13), "alchemist": (50, 49, 12),
+             "moth": (34, 83, 9), "spitter": (53, 48, 12),
+             "stalker": (58, 94, 14), "prism": (48, 57, 13), "oracle": (67, 46, 14)}
+
+    def __init__(self, kind, pos, level=1):
+        self.kind = kind
+        self.pos = V2(pos)
+        health, speed, damage = self.SPECS[kind]
+        self.max_hp = health + (level - 1) * 4
+        self.hp = self.max_hp
+        self.speed = speed + (level - 1) * 1.7
+        self.damage = damage + (level - 1) // 2
+        self.radius = 10
+        self.timer = 0.7 + (self.pos.x % 30) / 30
+        self.burst = 0.0
+        self.dash = V2()
+        self.flash = 0.0
+        self.attacking = False
+        self.moving = False
+        self.left = False
+        self.facing = V2(1, 0)
+        self.warning = self.explosion = None
+        self.blast_radius = 32
+        self.level = level
+        self.shot_direction = V2(1, 0)
+        self.hazards = []
+        self.orbit = -1 if self.pos.x % 2 else 1
+        self.frost_marks = self.ember_marks = 0
+        self.frost_window = self.ember_window = self.frozen = 0.0
+
+    def receive_shot(self, bullet, damage):
+        frontal = self.kind == "shield" and self.facing.dot(-unit(bullet.vel)) > 0.42
+        if frontal and not self.attacking and not bullet.blast:
+            damage = max(2, damage // 3)
+        self.receive_hit(damage)
+
+    def receive_hit(self, damage):
+        self.hp -= damage
+        self.flash = 0.18
+
+    def tick_status(self, dt):
+        self.frost_window = max(0, self.frost_window - dt)
+        self.ember_window = max(0, self.ember_window - dt)
+        self.frozen = max(0, self.frozen - dt)
+        if not self.frost_window:
+            self.frost_marks = 0
+        if not self.ember_window:
+            self.ember_marks = 0
+
+    def specialist(self, dt, player, delta, distance, direction, obstructed):
+        """Lock the aim during windup, then commit to the move or shot."""
+        shots = []
+        if self.kind == "stalker":
+            if self.burst > 0:
+                self.burst = max(0.0, self.burst - dt)
+                return self.dash * 3.15, shots
+            if self.attacking or (self.timer <= 0.43 and distance < 150 and not obstructed):
+                if not self.attacking:
+                    self.shot_direction = unit(delta, self.shot_direction)
+                self.attacking = self.timer > 0
+                if self.attacking:
+                    return -direction * 0.42, shots
+                self.burst, self.dash, self.timer = 0.29, self.shot_direction, 1.56
+                self.orbit *= -1
+                return self.dash * 3.15, shots
+            self.timer = max(0.18, self.timer)
+            return direction.rotate(self.orbit * (50 if distance < 175 else 22)), shots
+
+        # Ranged specialists retreat in open space and close in around cover.
+        if distance < 116 and not obstructed:
+            direction *= -0.76
+        elif distance < 205 and not obstructed:
+            direction = direction.rotate(self.orbit * 85) * 0.69
+        windup = 0.60 if self.kind == "oracle" else 0.48
+        can_attack = distance < 240 and (self.kind == "oracle" or not obstructed)
+        if not self.attacking and self.timer <= windup and can_attack:
+            self.attacking = True
+            self.shot_direction = unit(delta, self.shot_direction)
+            if self.kind == "oracle":
+                offset = self.shot_direction.rotate(90) * 33
+                for point, delay in ((player.pos, 0), (player.pos + offset, 0.24)):
+                    point, _ = clip_position(point, 16, ())
+                    self.hazards.append(Hazard(point, max(0.25, self.timer) + delay, 26, self.damage))
+        if self.attacking and self.timer <= 0:
+            self.attacking = False
+            self.timer = 2.38 if self.kind == "oracle" else 1.76
+            if self.kind == "prism":
+                for angle, curve in ((-33, 92), (0, 0), (33, -92)):
+                    shots.append(Bullet(self.pos.copy(), self.shot_direction.rotate(angle) * 202,
+                                        self.damage, "#c0a5f0", True, 3, curve=curve))
+            self.orbit *= -1
+        return direction, shots
+
+    def step(self, dt, player, barriers):
+        self.flash = max(0.0, self.flash - dt)
+        self.timer -= dt
+        delta = player.pos - self.pos
+        distance = delta.length()
+        direction = unit(delta)
+        self.facing = direction
+        self.explosion = None
+        self.left = delta.x < 0
+        obstacle = next((rect for rect in barriers if rect.clipline(self.pos, player.pos)), None)
+        obstructed = obstacle is not None
+        bullets = []
+        advanced = self.kind in ("stalker", "prism", "oracle")
+        if advanced:
+            direction, bullets = self.specialist(dt, player, delta, distance, direction, obstructed)
+        else:
+            self.attacking = False
+        if self.kind == "sentry":
+            if distance < 135 and not obstructed:
+                direction *= -0.78
+            elif distance < 190 and not obstructed:
+                direction = direction.rotate(90) * 0.6
+            self.attacking = self.timer < 0.28 and not obstructed
+            if self.timer <= 0 and not obstructed:
+                bullets.append(Bullet(self.pos.copy(), unit(delta, (1, 0)) * 165,
+                                      self.damage, "#e3a2fa", True, 3))
+                self.timer = 1.45
+        if self.kind in ("moth", "spitter"):
+            if distance < 118 and not obstructed:
+                direction *= -0.75
+            elif distance < 216 and not obstructed:
+                turn = -90 if self.kind == "moth" else 80
+                direction = direction.rotate(turn) * 0.75
+            windup = 0.50 if self.kind == "spitter" else 0.40
+            self.attacking = self.timer <= windup and not obstructed
+            if self.attacking:
+                self.shot_direction = unit(delta, self.shot_direction)
+            if self.timer <= 0 and not obstructed:
+                if self.kind == "moth":
+                    angles, speed, color, self.timer = (-13, 13), 196, "#b9b6f0", 1.90
+                else:
+                    angles, speed, color, self.timer = (-19, 0, 19), 163, "#c8dd83", 2.20
+                for angle in angles:
+                    velocity = self.shot_direction.rotate(angle) * speed
+                    bullets.append(Bullet(self.pos.copy(), velocity, self.damage, color, True, 3))
+        if self.kind == "alchemist":
+            if distance < 118 and not obstructed:
+                direction *= -0.62
+            elif distance < 178 and not obstructed:
+                direction = direction.rotate(-90) * 0.65
+            self.attacking = self.warning is not None or self.timer < 0.56
+            if self.timer < 0.56 and self.warning is None:
+                self.warning = player.pos.copy()
+            if self.timer <= 0:
+                self.explosion = self.warning
+                self.warning = None
+                self.timer = 2.50 - 0.045 * self.level
+        if self.kind == "crawler" and distance > 117 and self.burst <= 0:
+            self.timer = max(self.timer, 0.62)
+        if self.kind in ("crawler", "wisp", "shield"):
+            self.attacking = self.timer < 0.36 and self.burst <= 0
+            if self.burst > 0:
+                self.burst = max(0.0, self.burst - dt)
+                direction = self.dash * 2.9
+            elif self.timer <= 0:
+                self.burst, self.dash, self.timer = 0.30, direction, 2.15
+                direction *= 2.9
+            elif self.timer < 0.36:
+                direction = V2()
+        if obstacle is not None and not self.burst and direction.dot(unit(delta)) > 0.35:
+            direction = route_around(self.pos, player.pos, obstacle, self.radius, barriers)
+        previous = self.pos
+        displacement = direction * self.speed * dt
+        self.pos = move(self.pos, displacement, self.radius, barriers)
+        if (self.pos - previous).length_squared() < 0.05 and displacement.length_squared() > 0:
+            bypass = displacement.rotate(65 if int(self.timer * 2) % 2 else -65)
+            self.pos = move(self.pos, bypass, self.radius, barriers)
+        self.moving = (self.pos - previous).length_squared() > 0.05
+        return bullets
+
+
+def target_rect(pos, radius):
+    rect = pg.Rect(0, 0, radius * 2, radius * 2)
+    rect.center = pos
+    return rect
+
+
+def segment_hit(start, end, rect):
+    hit = rect.clipline(start, end)
+    return (V2(hit[0]) - start).length_squared() if hit else float("inf")
+
+
+def terrain_hit(start, end, barriers):
+    """Return the first surface and its outward normal, including the arena rim."""
+    hit_distance = float("inf")
+    normal = None
+    for rect, interior in [(ARENA, True), *((rect, False) for rect in barriers)]:
+        if interior and rect.collidepoint(end):
+            continue
+        hit = rect.clipline(start, end)
+        if not hit:
+            continue
+        point = V2(hit[1 if interior else 0])
+        distance = start.distance_squared_to(point)
+        if distance >= hit_distance:
+            continue
+        sides = ((abs(point.x-rect.left),(-1,0)), (abs(point.x-(rect.right-1)),(1,0)),
+                 (abs(point.y-rect.top),(0,-1)), (abs(point.y-(rect.bottom-1)),(0,1)))
+        normal = V2(min(sides, key=lambda pair: pair[0])[1])
+        if interior:
+            normal *= -1
+        hit_distance = distance
+    return hit_distance, normal
+
+
+def route_around(start, goal, obstacle, radius, barriers):
+    """Steer past the nearest corner with a clear approach."""
+    expanded = obstacle.inflate(radius * 2 + 6, radius * 2 + 6)
+    corners = [V2(point) for point in
+               (expanded.topleft, expanded.topright, expanded.bottomleft, expanded.bottomright)]
+    blocked = [rect.inflate(radius * 2, radius * 2) for rect in barriers]
+    options = [point for point in corners
+               if ARENA.inflate(-radius * 2, -radius * 2).collidepoint(point)
+               and point.distance_squared_to(start) > 9
+               and not any(rect.clipline(start, point) for rect in blocked)]
+    if not options:
+        return unit(goal - start)
+    waypoint = min(options, key=lambda point: point.distance_to(start) + point.distance_to(goal))
+    return unit(waypoint - start)
+
+
+# Dungeon ---------------------------------------------------------------------
+LEVELS = ("Моховая роща", "Янтарные катакомбы", "Ледяные руины")
+FLOORS_PER_REGION = 5
+TOTAL_FLOORS = len(LEVELS) * FLOORS_PER_REGION
+THEME_COLORS = ("#b4cb85", "#eda66c", "#afe3e4")
+BOSS_NAMES = ("Терновый олень", "Печник", "Ледяная королева")
+ROOM_LABELS = {
+    "entry": "Вход", "combat": "Зал", "treasure": "Тайник", "vault": "Арсенал",
+    "exit": "Врата спуска", "boss": "Арена босса",
+}
+DOORS = {
+    (0, -1): ((320, 69), (320, 279), "Север"),
+    (0, 1): ((320, 306), (320, 93), "Юг"),
+    (-1, 0): ((40, 188), (571, 188), "Запад"),
+    (1, 0): ((599, 188), (69, 188), "Восток"),
+}
+LAYOUTS = (
+    ((0,164,120,27,16),(0,475,250,30,18),(1,339,121,38,16),(3,496,119,19,13)),
+    ((2,184,160,28,18),(2,466,212,30,18),(1,286,264,36,20),(3,464,107,20,13)),
+    ((0,119,125,29,17),(0,127,242,28,19),(4,501,130,35,22),(4,489,239,33,23)),
+    ((1,183,121,37,18),(0,203,239,32,17),(1,440,127,35,18),(0,443,242,32,17)),
+    ((2,209,121,31,19),(2,396,116,35,19),(3,235,247,19,14),(4,456,235,35,22)),
+    ((0,132,146,30,18),(4,249,219,31,21),(4,389,153,30,23),(0,497,232,31,19)),
+    ((3,218,159,20,14),(3,426,216,20,15),(0,285,116,34,18),(0,358,250,34,19)),
+    ((2,125,114,32,19),(1,482,259,35,18),(4,249,151,32,19),(0,405,224,33,18)),
+)
+CENTER = V2(320, 188)
+CHEST_RECT = pg.Rect(306, 180, 28, 18)
+SECOND_WAVE_CHANCE = 0.50
+WAVE_DELAY = 1.15
+FLOOR_RECOVERY = 55
+DROP_TICKETS = 200
+AMMO_DROP_TICKETS = 11
+HEAL_DROP_TICKETS = 9
+LOOT = {"heal": "Аптечка", "ammo": "Патроны", "power": "Урон +2", "vital": "Здоровье +15"}
+LOOT.update({key: weapon.name for key, weapon in WEAPONS.items()})
+
+
+def region_of(level):
+    return (level - 1) // FLOORS_PER_REGION
+
+
+def floor_of(level):
+    return (level - 1) % FLOORS_PER_REGION + 1
+
+
+@dataclass
+class Drop:
+    kind: str
+    pos: V2
+    clip: Magazine | None = None
+    origin: V2 | None = None
+    born: float = 0.0
+
+    def ready(self, now):
+        return self.origin is None or now - self.born >= 0.30
+
+    def position(self, now):
+        if self.ready(now):
+            return self.pos + (0, int(math.sin(now * 7 + self.pos.x) * 2))
+        step = max(0.0, (now - self.born) / 0.30)
+        return self.origin.lerp(self.pos, step) - (0, 24 * math.sin(step * math.pi))
+
+
+@dataclass
+class Room:
+    kind: str
+    theme: int
+    seed: int
+    props: list = field(default_factory=list)
+    enemies: list = field(default_factory=list)
+    reinforcements: list = field(default_factory=list)
+    wave: int = 1
+    wave_wait: float | None = None
+    loot: list = field(default_factory=list)
+    links: set = field(default_factory=set)
+    chest: str = ""
+    opened: bool = False
+    opened_at: float = 0.0
+    visited: bool = False
+    rewarded: bool = False
+
+    @property
+    def barriers(self):
+        obstacles = [rect for _, rect in self.props]
+        return obstacles + [CHEST_RECT.copy()] if self.chest else obstacles
